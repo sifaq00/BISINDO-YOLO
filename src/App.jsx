@@ -1,26 +1,12 @@
-import React from 'react';
-import Navbar from './components/Navbar';
-import Hero from './components/Hero';
-import AboutUs from './components/AboutUs';
-import Services from './components/Services';
-import Portfolio from './components/Portfolio';
-import Testimonials from './components/Testimonials';
-import ContactForm from './components/ContactForm';
-import Footer from './components/Footer';
+import Detection from './components/Detection';
 
-const App = () => {
+function App() {
   return (
-    <div>
-      <Navbar />
-      <Hero />
-      <AboutUs />
-      <Services />
-      <Portfolio />
-      <Testimonials />
-      <ContactForm />
-      <Footer />
+    <div className="min-h-screen bg-gray-100 flex flex-col items-center justify-center p-4">
+      <h1 className="text-3xl font-bold mb-4">Deteksi BISINDO Real-Time</h1>
+      <Detection />
     </div>
   );
-};
+}
 
 export default App;
