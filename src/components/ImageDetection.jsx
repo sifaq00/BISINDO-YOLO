@@ -1,192 +1,151 @@
-import { useEffect, useRef, useState } from "react";
-import * as tf from "@tensorflow/tfjs";
-import labels from "../utils/labels.json";
+import { useRef, useState } from "react";
 import { FaUpload } from "react-icons/fa";
+import labels from "../utils/labels.json";
 
-const MODEL_SIZE = 640;
+// ====== Konfigurasi backend ======
+const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
+const DETECT_URL = `${API_BASE}/detect`;
 
-// ======== Tuning tampilan (samakan dengan webcam) ========
-const FONT_SCALE = 4.0;            // skala font relatif ketebalan bbox
-const PAD_X_SCALE = 2.0;           // padding horizontal label relatif lineW
-const PAD_Y_SCALE = 1.2;           // padding vertikal label relatif lineW
+// ====== Logging ======
+const DEBUG = (import.meta.env.VITE_DEBUG_CONSOLE ?? "true") !== "false";
+function dlog(...args) { if (DEBUG) console.log(...args); }
+function derr(...args) { if (DEBUG) console.error(...args); }
+function group(name, collapsed = true) {
+  if (!DEBUG) return { end: () => {} };
+  const fn = collapsed ? console.groupCollapsed : console.group;
+  fn.call(console, name);
+  return { end: () => console.groupEnd() };
+}
 
-// Warna deterministik per classId (golden angle supaya merata & kontras)
+// Tuning tampilan
+const FONT_SCALE = 4.0;
 function classColorFromId(id) {
   const h = (Math.abs(id) * 137.508) % 360;
-  const s = 90;
-  const l = 55;
-  return `hsl(${h}deg ${s}% ${l}%)`;
+  return `hsl(${h}deg 90% 55%)`;
 }
 
 export default function ImageDetection() {
-  const [model, setModel] = useState(null);
-  const [loading, setLoading] = useState("Memuat model...");
   const canvasRef = useRef(null);
-
-  useEffect(() => {
-    (async () => {
-      try {
-        await tf.setBackend("webgl");
-        await tf.ready();
-
-        const m = await tf.loadGraphModel("/bestlasttrain_web_model/model.json");
-        // Warm-up
-        const dummy = tf.zeros([1, MODEL_SIZE, MODEL_SIZE, 3]);
-        const warm = await m.executeAsync(dummy);
-        if (Array.isArray(warm)) warm.forEach((t) => t.dispose());
-        else warm?.dispose();
-        dummy.dispose();
-
-        setModel(m);
-        setLoading(null);
-      } catch (e) {
-        console.error(e);
-        setLoading("Gagal memuat model.");
-      }
-    })();
-  }, []);
-
-  // === Letterbox preprocess (114/255) + return r0 & pad untuk mapping balik
-  function preprocess(source) {
-    const sw = source.naturalWidth || source.width;
-    const sh = source.naturalHeight || source.height;
-
-    const r0 = Math.min(MODEL_SIZE / sw, MODEL_SIZE / sh);
-    const nw = Math.round(sw * r0);
-    const nh = Math.round(sh * r0);
-    const padX0 = (MODEL_SIZE - nw) / 2;
-    const padY0 = (MODEL_SIZE - nh) / 2;
-
-    const img = tf.browser.fromPixels(source);
-    const imgFloat = img.toFloat().div(255);
-    const resized = tf.image.resizeBilinear(imgFloat, [nh, nw], true);
-
-    const padValue = 114 / 255;
-    const top = Math.floor(padY0), bottom = Math.ceil(padY0);
-    const left = Math.floor(padX0), right = Math.ceil(padX0);
-    const padded = tf.pad(resized, [[top, bottom], [left, right], [0, 0]], padValue);
-
-    const tensor = padded.expandDims(0);
-    img.dispose(); imgFloat.dispose(); resized.dispose(); padded.dispose();
-    return { tensor, r0, padX0, padY0 };
-  }
-
-  async function detect(img) {
-    if (!model) return [];
-    const { tensor, r0, padX0, padY0 } = preprocess(img);
-    try {
-      const outputs = await model.executeAsync(tensor);
-      tensor.dispose();
-
-      let detTensor = Array.isArray(outputs)
-        ? outputs.find((t) => t.shape.length === 3 && t.shape.at(-1) === 6)
-        : outputs;
-      if (!detTensor) {
-        if (Array.isArray(outputs)) outputs.forEach((t) => t.dispose());
-        else outputs?.dispose();
-        return [];
-      }
-
-      const raw = detTensor.arraySync()[0]; // [N,6] -> [x1,y1,x2,y2,conf,cls]
-      const dets = [];
-      for (let i = 0; i < raw.length; i++) {
-        const [x1, y1, x2, y2, conf, classId] = raw[i];
-        if (conf >= 0.4) {
-          dets.push({
-            x: x1, y: y1, w: x2 - x1, h: y2 - y1,
-            score: conf, classId, r0, padX0, padY0
-          });
-        }
-      }
-
-      if (Array.isArray(outputs)) outputs.forEach((t) => t.dispose());
-      else outputs?.dispose();
-
-      return dets;
-    } catch (e) {
-      console.error(e);
-      tensor.dispose();
-      return [];
-    }
-  }
+  const [loading, setLoading] = useState(null);
 
   const handleImageUpload = (e) => {
     const f = e.target.files?.[0];
     if (!f) return;
+    const g = group(`[UPLOAD] ${f.name} (${(f.size/1024).toFixed(1)} KB, ${f.type})`, false);
     const img = new Image();
     img.src = URL.createObjectURL(f);
     img.onload = async () => {
+      dlog("  · natural size:", img.naturalWidth, "x", img.naturalHeight);
       URL.revokeObjectURL(img.src);
-      const dets = await detect(img);
-      draw(img, dets);
+      await runDetectionOnImage(img);
+      g.end?.();
     };
   };
 
-  function draw(img, dets) {
+  async function runDetectionOnImage(imgEl) {
+    const g = group("[DETECT Image] send");
+    try {
+      setLoading("Memproses…");
+
+      // Kirim gambar sebagai dataURL
+      const off = document.createElement("canvas");
+      off.width = imgEl.naturalWidth;
+      off.height = imgEl.naturalHeight;
+      const octx = off.getContext("2d");
+      octx.drawImage(imgEl, 0, 0);
+      const dataUrl = off.toDataURL("image/jpeg", 0.9);
+
+      const approxBytes = Math.round((dataUrl.length * 3) / 4);
+      dlog("  · payload ~", (approxBytes/1024).toFixed(1), "KB");
+
+      const t0 = performance.now();
+      const res = await fetch(DETECT_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image: dataUrl }),
+      });
+      const t1 = performance.now();
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const detections = await res.json();
+      dlog("  ✔ response in", (t1 - t0).toFixed(1), "ms | count:", Array.isArray(detections) ? detections.length : 0);
+      if (Array.isArray(detections)) {
+        console.table(detections.map(d => ({
+          class: d.className ?? labels[Math.round(d.classId ?? -1)] ?? d.classId,
+          score: (d.score ?? 0).toFixed(3),
+          x1: Math.round(d.x1), y1: Math.round(d.y1),
+          x2: Math.round(d.x2), y2: Math.round(d.y2),
+        })));
+      }
+
+      drawResult(imgEl, Array.isArray(detections) ? detections : []);
+    } catch (e) {
+      derr(e);
+      alert("Gagal mendeteksi gambar.");
+    } finally {
+      setLoading(null);
+      g.end?.();
+    }
+  }
+
+  function drawResult(img, dets) {
     const canvas = canvasRef.current;
     const ctx = canvas.getContext("2d");
-    const imgW = img.naturalWidth;
-    const imgH = img.naturalHeight;
 
-    // Hi-DPI scaling
+    const w = img.naturalWidth;
+    const h = img.naturalHeight;
+
+    // Hi-DPI
     const dpr = window.devicePixelRatio || 1;
-    canvas.width  = Math.round(imgW * dpr);
-    canvas.height = Math.round(imgH * dpr);
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    ctx.clearRect(0, 0, imgW, imgH);
-    ctx.drawImage(img, 0, 0, imgW, imgH);
+    // gambar asli
+    ctx.clearRect(0, 0, w, h);
+    ctx.drawImage(img, 0, 0, w, h);
 
-    // Ketebalan & ukuran font adaptif (tebal & besar)
-    const minSide = Math.min(imgW, imgH);
-    const lineW  = Math.max(6, Math.round(minSide / 110));                // tebal bbox
-    const fontPx = Math.max(20, Math.round(lineW * FONT_SCALE));          // besar font
-    const padX   = Math.max(10, Math.round(lineW * PAD_X_SCALE));         // padding label X
-    const padY   = Math.max(6,  Math.round(lineW * PAD_Y_SCALE));         // padding label Y
+    // tebal & font
+    const minSide = Math.min(w, h);
+    const lineW = Math.max(6, Math.round(minSide / 110));
+    const fontPx = Math.max(20, Math.round(lineW * FONT_SCALE));
+    const padX = Math.max(10, Math.round(lineW * 2.0));
+    const padY = Math.max(6, Math.round(lineW * 1.2));
 
     ctx.textBaseline = "top";
     ctx.lineJoin = "round";
     ctx.miterLimit = 2;
+    ctx.font = `600 ${fontPx}px Inter, Arial, sans-serif`;
 
-    dets.forEach((d) => {
-      const x = (d.x - d.padX0) / d.r0;
-      const y = (d.y - d.padY0) / d.r0;
-      const w = d.w / d.r0;
-      const h = d.h / d.r0;
-
-      const classId = Math.round(d.classId);
+    const g = group("[DRAW] results");
+    for (const d of dets) {
+      const x = d.x1, y = d.y1, bw = d.x2 - d.x1, bh = d.y2 - d.y1;
+      const classId = Math.round(d.classId ?? -1);
       const color = classColorFromId(classId);
 
-      // BBOX (warna per-kelas)
-      ctx.lineWidth   = lineW;
+      // bbox
+      ctx.lineWidth = lineW;
       ctx.strokeStyle = color;
-      ctx.strokeRect(x, y, w, h);
+      ctx.strokeRect(x, y, bw, bh);
 
-      // Label dengan background = warna bbox, teks hitam
-      const label = labels[classId] ?? `cls ${classId}`;
-      const text  = `${label} (${d.score.toFixed(2)})`;
+      // label
+      const label = d.className ?? labels[classId] ?? `cls ${classId}`;
+      const text = `${label} (${(d.score ?? 0).toFixed(2)})`;
 
-      ctx.font = `600 ${fontPx}px Inter, Arial, sans-serif`; // semi-bold biar rapi
       const tw = ctx.measureText(text).width;
       const th = fontPx + padY;
 
-      // posisi default: di atas-kiri bbox; kalau mepet atas, taruh di dalam
       let lx = x - Math.floor(lineW / 2);
       let ly = y - th - lineW;
       if (ly < lineW) ly = y + lineW;
 
-      // background label warna kelas
       ctx.fillStyle = color;
       ctx.fillRect(lx, ly, tw + padX, th);
 
-      // teks hitam
-      ctx.fillStyle = "#000000";
-      ctx.fillText(
-        text,
-        lx + Math.round(padX / 2),
-        ly + Math.round((th - fontPx) / 2)
-      );
-    });
+      ctx.fillStyle = "#000";
+      ctx.fillText(text, lx + Math.round(padX / 2), ly + Math.round((th - fontPx) / 2));
+    }
+    g.end?.();
   }
 
   return (
